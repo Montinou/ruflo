@@ -87,6 +87,7 @@ analyzing
 api-project/
 bin/claude-flow-*
 build/
+.claude/
 claude-flow
 claude-flow-mcp-wrapper
 claude-flow.config.json

@@ -14,6 +14,54 @@ import { existsSync, mkdirSync, readFileSync, unlinkSync, writeFileSync } from '
 import { join, resolve } from 'path';
 import type { MCPTool } from './types.js';
 
+// Jina Reranker for post-retrieval re-scoring
+let jinaReranker: { rerank: (query: string, documents: string[], topN?: number) => Promise<Array<{ index: number; relevance_score: number }>> } | null = null;
+try {
+  // Load .env for JINA_API_KEY if not already in process.env
+  if (!process.env.JINA_API_KEY) {
+    const envPaths = [
+      resolve(process.cwd(), '.env'),
+      resolve(process.env.CLAUDE_PROJECT_DIR || process.cwd(), '.env'),
+    ];
+    for (const envPath of envPaths) {
+      try {
+        const envContent = readFileSync(envPath, 'utf-8');
+        for (const line of envContent.split('\n')) {
+          const match = line.match(/^([A-Z_][A-Z0-9_]*)=["']?(.+?)["']?\s*$/);
+          if (match && !process.env[match[1]]) {
+            process.env[match[1]] = match[2];
+          }
+        }
+        break;
+      } catch { /* try next */ }
+    }
+  }
+
+  const jinaKey = process.env.JINA_API_KEY;
+  if (jinaKey) {
+    jinaReranker = {
+      rerank: async (query: string, documents: string[], topN: number = 5) => {
+        const response = await fetch('https://api.jina.ai/v1/rerank', {
+          method: 'POST',
+          headers: {
+            'Authorization': `Bearer ${jinaKey}`,
+            'Content-Type': 'application/json',
+          },
+          body: JSON.stringify({
+            model: process.env.JINA_RERANK_MODEL || 'jina-reranker-v2-base-multilingual',
+            query,
+            documents,
+            top_n: topN,
+          }),
+        });
+        if (!response.ok) throw new Error(`Jina rerank failed: ${response.status}`);
+        const data = await response.json() as { results: Array<{ index: number; relevance_score: number }> };
+        return data.results;
+      },
+    };
+  }
+} catch { /* Jina reranking is optional */ }
+
 // Legacy JSON store interface (for migration)
 interface LegacyMemoryEntry {
   key: string;
@@ -319,7 +367,7 @@ export const memoryTools: MCPTool[] = [
   },
   {
     name: 'memory_search',
-    description: 'Semantic vector search using HNSW index (150x-12,500x faster than keyword search)',
+    description: 'Semantic vector search using HNSW index with optional Jina reranking for improved relevance',
     category: 'memory',
     inputSchema: {
       type: 'object',
@@ -328,6 +376,7 @@ export const memoryTools: MCPTool[] = [
         namespace: { type: 'string', description: 'Namespace to search (default: "default")' },
         limit: { type: 'number', description: 'Maximum results (default: 10)' },
         threshold: { type: 'number', description: 'Minimum similarity threshold 0-1 (default: 0.3)' },
+        rerank: { type: 'boolean', description: 'Re-rank results with Jina for better relevance (default: true if JINA_API_KEY set)' },
       },
       required: ['query'],
     },
@@ -339,23 +388,27 @@ export const memoryTools: MCPTool[] = [
       const namespace = (input.namespace as string) || 'default';
       const limit = (input.limit as number) || 10;
       const threshold = (input.threshold as number) || 0.3;
+      const shouldRerank = input.rerank !== undefined ? (input.rerank as boolean) : !!jinaReranker;
 
       validateMemoryInput(undefined, undefined, query);
 
       const startTime = performance.now();
 
       try {
+        // Fetch more candidates when reranking (reranker picks best from larger pool)
+        const fetchLimit = shouldRerank && jinaReranker ? Math.max(limit * 3, 20) : limit;
+
         const result = await searchEntries({
           query,
           namespace,
-          limit,
+          limit: fetchLimit,
           threshold,
         });
 
-        const duration = performance.now() - startTime;
+        const hnswDuration = performance.now() - startTime;
 
         // Parse JSON values in results
-        const results = result.results.map(r => {
+        let results = result.results.map(r => {
           let value: unknown = r.content;
           try {
             value = JSON.parse(r.content);
@@ -368,15 +421,46 @@ export const memoryTools: MCPTool[] = [
             namespace: r.namespace,
             value,
             similarity: r.score,
+            rerankScore: undefined as number | undefined,
           };
         });
+
+        // Jina reranking pass
+        let reranked = false;
+        let rerankDuration = 0;
+        if (shouldRerank && jinaReranker && results.length > 0) {
+          const rerankStart = performance.now();
+          try {
+            const documents = results.map(r =>
+              typeof r.value === 'string' ? r.value : JSON.stringify(r.value)
+            );
+            const ranked = await jinaReranker.rerank(query, documents, limit);
+            rerankDuration = performance.now() - rerankStart;
+
+            // Reorder results by Jina relevance score
+            results = ranked.map(r => ({
+              ...results[r.index],
+              rerankScore: r.relevance_score,
+            }));
+            reranked = true;
+          } catch {
+            // Reranking failed, fall back to HNSW order
+            results = results.slice(0, limit);
+          }
+        } else {
+          results = results.slice(0, limit);
+        }
+
+        const totalDuration = performance.now() - startTime;
 
         return {
           query,
           results,
           total: results.length,
-          searchTime: `${duration.toFixed(2)}ms`,
-          backend: 'HNSW + sql.js',
+          searchTime: `${totalDuration.toFixed(2)}ms`,
+          hnswTime: `${hnswDuration.toFixed(2)}ms`,
+          ...(reranked ? { rerankTime: `${rerankDuration.toFixed(2)}ms`, reranker: 'jina-reranker-v2-base-multilingual' } : {}),
+          backend: reranked ? 'HNSW + sql.js + Jina rerank' : 'HNSW + sql.js',
         };
       } catch (error) {
         return {

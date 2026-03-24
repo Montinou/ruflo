@@ -292,7 +292,7 @@
     "claude-flow": {
       "command": "node",
       "args": [
-        "/workspaces/claude-flow/v3/@claude-flow/cli/bin/cli.js",
+        "/home/lord_montino/ruflo/v3/@claude-flow/cli/bin/cli.js",
         "mcp",
         "start"
       ]

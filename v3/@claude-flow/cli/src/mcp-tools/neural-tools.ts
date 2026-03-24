@@ -16,15 +16,66 @@ import type { MCPTool } from './types.js';
 import { existsSync, readFileSync, writeFileSync, mkdirSync } from 'node:fs';
 import { join } from 'node:path';
 
-// Try to import real embeddings — prefer agentic-flow v3 ReasoningBank, then @claude-flow/embeddings
+// Try to import real embeddings — prefer Venice (OpenAI-compat), then agentic-flow, then @claude-flow/embeddings
 let realEmbeddings: { embed: (text: string) => Promise<number[]> } | null = null;
 let embeddingServiceName: string = 'none';
+let jinaReranker: { rerank: (query: string, documents: string[], topN?: number) => Promise<Array<{ index: number; relevance_score: number }>> } | null = null;
+
+// Load .env if dotenv-style vars aren't in process.env
 try {
+  if (!process.env.VENICE_API_KEY) {
+    const { readFileSync } = await import('node:fs');
+    const { resolve } = await import('node:path');
+    const envPaths = [
+      resolve(process.cwd(), '.env'),
+      resolve(process.env.CLAUDE_PROJECT_DIR || process.cwd(), '.env'),
+    ];
+    for (const envPath of envPaths) {
+      try {
+        const envContent = readFileSync(envPath, 'utf-8');
+        for (const line of envContent.split('\n')) {
+          const match = line.match(/^([A-Z_][A-Z0-9_]*)=["']?(.+?)["']?\s*$/);
+          if (match && !process.env[match[1]]) {
+            process.env[match[1]] = match[2];
+          }
+        }
+        break;
+      } catch { /* try next path */ }
+    }
+  }
+} catch { /* .env loading is best-effort */ }
+
+try {
+  // Tier 0: Vercel AI Gateway (OpenAI-compatible, configurable via VERCEL_AI_GATEWAY_KEY)
+  const vercelGatewayKey = process.env.VERCEL_AI_GATEWAY_KEY;
+  if (vercelGatewayKey && !realEmbeddings) {
+    const gatewayBaseURL = process.env.VERCEL_AI_GATEWAY_EMBEDDING_URL || 'https://gateway.ai.vercel.app/v1/embeddings';
+    const embeddingModel = process.env.VERCEL_AI_GATEWAY_EMBEDDING_MODEL || 'text-embedding-3-small';
+    realEmbeddings = {
+      embed: async (text: string) => {
+        const response = await fetch(gatewayBaseURL, {
+          method: 'POST',
+          headers: {
+            'Authorization': `Bearer ${vercelGatewayKey}`,
+            'Content-Type': 'application/json',
+          },
+          body: JSON.stringify({ input: text, model: embeddingModel }),
+        });
+        if (!response.ok) throw new Error(`Vercel AI Gateway embedding failed: ${response.status}`);
+        const data = await response.json() as { data: Array<{ embedding: number[] }> };
+        return data.data[0].embedding;
+      },
+    };
+    embeddingServiceName = `vercel-ai-gateway/${embeddingModel}`;
+  }
+
   // Tier 1: agentic-flow v3 ReasoningBank (fastest — WASM-accelerated)
-  const rb = await import('agentic-flow/reasoningbank').catch(() => null);
-  if (rb?.computeEmbedding) {
-    realEmbeddings = { embed: (text: string) => rb.computeEmbedding(text) };
-    embeddingServiceName = 'agentic-flow/reasoningbank';
+  if (!realEmbeddings) {
+    const rb = await import('agentic-flow/reasoningbank').catch(() => null);
+    if (rb?.computeEmbedding) {
+      realEmbeddings = { embed: (text: string) => rb.computeEmbedding(text) };
+      embeddingServiceName = 'agentic-flow/reasoningbank';
+    }
   }
 
   // Tier 2: @claude-flow/embeddings
@@ -51,6 +102,31 @@ try {
         embeddingServiceName = 'mock';
       }
     }
+  }
+
+  // Jina Reranker (used after initial retrieval to re-score results)
+  const jinaKey = process.env.JINA_API_KEY;
+  if (jinaKey) {
+    jinaReranker = {
+      rerank: async (query: string, documents: string[], topN: number = 5) => {
+        const response = await fetch('https://api.jina.ai/v1/rerank', {
+          method: 'POST',
+          headers: {
+            'Authorization': `Bearer ${jinaKey}`,
+            'Content-Type': 'application/json',
+          },
+          body: JSON.stringify({
+            model: process.env.JINA_RERANK_MODEL || 'jina-reranker-v2-base-multilingual',
+            query,
+            documents,
+            top_n: topN,
+          }),
+        });
+        if (!response.ok) throw new Error(`Jina rerank failed: ${response.status}`);
+        const data = await response.json() as { results: Array<{ index: number; relevance_score: number }> };
+        return data.results;
+      },
+    };
   }
 } catch {
   // No embedding provider available, will use fallback
